@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Invoice Tracker</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--tx:#1d1d1b;--mu:#6b6b66;--bd:#e2e2dd;--ac:#1f6feb;--ok:#1a7f4b;--wa:#b26a00;--er:#c62828;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#201f1e;--tx:#ecece8;--mu:#9a9a94;--bd:#33322f;--ac:#5b9dff;--ok:#4cc38a;--wa:#e0a040;--er:#ef6b6b;color-scheme:dark}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:16px}h1{font-size:20px;margin:0 0 12px}h2{font-size:15px;margin:20px 0 8px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 12px}.card b{display:block;font-size:22px}.card span{color:var(--mu);font-size:12px}
+#drop{border:2px dashed var(--bd);border-radius:10px;padding:26px;text-align:center;color:var(--mu);margin:12px 0;cursor:pointer}#drop.over{border-color:var(--ac);color:var(--ac)}
+.bar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;align-items:center}input,select,button{font:inherit;color:var(--tx);background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}button{cursor:pointer}button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
+.tabs button.on{background:var(--ac);color:#fff;border-color:var(--ac)}
+.w{overflow-x:auto}table{border-collapse:collapse;width:100%;background:var(--card);border:1px solid var(--bd)}th,td{padding:6px 8px;border-bottom:1px solid var(--bd);text-align:left;white-space:nowrap}th{font-size:12px;color:var(--mu)}
+.t{font-size:11px;border-radius:10px;padding:1px 7px;border:1px solid currentColor;margin-right:3px}.ok{color:var(--ok)}.wa{color:var(--wa)}.er{color:var(--er)}
+details{background:var(--card);border:1px solid var(--bd);border-radius:8px;margin:6px 0;padding:6px 10px}summary{cursor:pointer;font-weight:600}details details{margin-left:12px}
+dialog{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:10px;max-width:420px;width:92%}dialog label{display:block;margin:8px 0;font-size:12px;color:var(--mu)}dialog input{width:100%}
+.note{color:var(--mu);font-size:12px}a{color:var(--ac);cursor:pointer}#login{text-align:center;padding:60px 0}
+</style></head><body><main>
+<h1>Invoice Tracker</h1>
+<div id="login"><p>Sign in with the Google account whose Drive will store your invoices.</p><button class="p" id="signin">Sign in with Google</button><p id="lmsg" class="note"></p></div>
+<div id="app" hidden>
+<div class="cards" id="cards"></div>
+<div id="drop">Drop supplier PDF invoices here, or click to browse<input id="file" type="file" accept="application/pdf" multiple hidden></div>
+<div id="msg" class="note"></div>
+<div class="bar tabs"><button data-v="list" class="on">Invoices</button><button data-v="rec">Received date view</button><button data-v="inv">Invoice date view</button><button data-v="aud">Audit history</button></div>
+<div id="view"></div>
+<h2>Monthly summary</h2><div class="w" id="monthly"></div>
+<p class="note">Each PDF is saved once in your Google Drive, in InvoiceTracker / year / month folders by received date. The Invoice date view is built inside this app from the same records, so no PDF is copied. Xero verification is not connected yet, so ticking “Uploaded to Xero” is recorded as manual and unverified.</p>
+</div>
+<dialog id="dlg"><form method="dialog" id="f"></form></dialog>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+const CID='563130702056-h07e2a1gn3g6q3tvnkch6endb59m7in8.apps.googleusercontent.com';
+const $=s=>document.querySelector(s),E=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+let TOKEN='',FOLDER='',JID='',D={inv:[],aud:[]},VIEW='list',Q={t:'',s:'',a:'',b:''},chain=Promise.resolve();
+const INV=()=>D.inv;
+/* ---------- Google Drive ---------- */
+async function api(url,o={}){const r=await fetch(url,{...o,headers:{Authorization:'Bearer '+TOKEN,...(o.headers||{})}});if(r.status===401){$('#msg').textContent='Session expired. Reload the page and sign in again.';throw new Error('auth')}if(!r.ok)throw new Error(await r.text());return r}
+const q=s=>encodeURIComponent(s);
+async function find(query){return(await(await api('https://www.googleapis.com/drive/v3/files?fields=files(id)&q='+q(query))).json()).files[0]}
+async function multipart(meta,blob,type){const b='xxinvxx';const body=new Blob([`--${b}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(meta)}\r\n--${b}\r\nContent-Type: ${type}\r\n\r\n`,blob,`\r\n--${b}--`]);
+ return(await(await api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',{method:'POST',headers:{'Content-Type':'multipart/related; boundary='+b},body})).json()).id}
+async function setup(){let f=await find("name='InvoiceTracker' and mimeType='application/vnd.google-apps.folder' and trashed=false");
+ if(!f)f=await(await api('https://www.googleapis.com/drive/v3/files?fields=id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'InvoiceTracker',mimeType:'application/vnd.google-apps.folder'})})).json();
+ FOLDER=f.id;let j=await find(`name='invoices.json' and '${FOLDER}' in parents and trashed=false`);
+ if(j)JID=j.id,D=await(await api(`https://www.googleapis.com/drive/v3/files/${JID}?alt=media`)).json();
+ else JID=await multipart({name:'invoices.json',parents:[FOLDER]},new Blob([JSON.stringify(D)]),'application/json');
+ D.inv??=[];D.aud??=[]}
+const FC={};async function sub(name,parent){const k=parent+'/'+name;if(FC[k])return FC[k];let f=await find(`name='${name}' and mimeType='application/vnd.google-apps.folder' and '${parent}' in parents and trashed=false`);
+ if(!f)f=await(await api('https://www.googleapis.com/drive/v3/files?fields=id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,mimeType:'application/vnd.google-apps.folder',parents:[parent]})})).json();return FC[k]=f.id}
+function persist(){chain=chain.then(()=>api(`https://www.googleapis.com/upload/drive/v3/files/${JID}?uploadType=media`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(D)})).catch(e=>{$('#msg').textContent='Could not save to Drive: '+e.message});return chain}
+function audit(r,act,det){D.aud.unshift({at:new Date().toISOString(),id:r.id,ref:(r.supplier||'?')+' / '+(r.number||'?'),act,det:det||''})}
+/* ---------- Reading invoices ---------- */
+const norm=s=>String(s||'').toLowerCase().replace(/\b(pte|ltd|sdn|bhd|llp|inc|co)\b\.?/g,'').replace(/[^a-z0-9]/g,'');
+const nn=s=>String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'').replace(/^0+/,'');
+const iso=(y,m,d)=>(m>=1&&m<=12&&d>=1&&d<=31)?`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`:'';
+function pd(s){s=String(s).trim();let m;
+ if(m=s.match(/(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/))return iso(+m[1],+m[2],+m[3]);
+ if(m=s.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/))return iso(m[3].length<4?2000+ +m[3]:+m[3],+m[2],+m[1]);
+ if(m=s.match(/(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,})[a-z]*[,\s-]+(\d{4})/)){const i=MON.findIndex(x=>m[2].toLowerCase().startsWith(x.toLowerCase()));if(i>=0)return iso(+m[3],i+1,+m[1])}
+ if(m=s.match(/([A-Za-z]{3,})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})/)){const i=MON.findIndex(x=>m[1].toLowerCase().startsWith(x.toLowerCase()));if(i>=0)return iso(+m[3],i+1,+m[2])}
+ return''}
+const DRE='(\\d{1,4}[-\\/.]\\d{1,2}[-\\/.]\\d{1,4}|\\d{1,2}(?:st|nd|rd|th)?[\\s-]+[A-Za-z]{3,9}[,\\s-]+\\d{4}|[A-Za-z]{3,9}\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?,?\\s+\\d{4})';
+function extract(text){const o={supplier:'',number:'',date:''};
+ let m=text.match(/(?:tax\s+)?invoice\s*(?:no\.?|number|num|#)\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})/i)||text.match(/\binv(?:oice)?[-\s#:]*([A-Z0-9]*\d[A-Z0-9\-\/]{2,})/i);if(m)o.number=m[1];
+ m=text.match(new RegExp('(?:invoice\\s*date|date\\s*of\\s*issue|issue\\s*date|date)\\s*[:.]?\\s*'+DRE,'i'))||text.match(new RegExp(DRE));if(m)o.date=pd(m[1]);
+ m=text.match(/(?:from|supplier|vendor|billed\s*by)\s*[:\-]\s*(.+)/i);
+ const ln=text.split('\n').map(x=>x.trim()).filter(x=>/[A-Za-z]{3}/.test(x)&&!/^(tax\s+)?invoice\b/i.test(x)&&!/^page\b/i.test(x));
+ o.supplier=(m?m[1]:ln[0]||'').slice(0,80).trim();return o}
+let workerReady;async function initPdf(){if(workerReady)return;const u='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+ try{pdfjsLib.GlobalWorkerOptions.workerSrc=URL.createObjectURL(new Blob([await(await fetch(u)).text()],{type:'text/javascript'}))}catch(e){pdfjsLib.GlobalWorkerOptions.workerSrc=u}workerReady=1}
+async function readPdf(file){await initPdf();const doc=await pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;let t='';
+ for(let p=1;p<=Math.min(2,doc.numPages);p++){const c=await(await doc.getPage(p)).getTextContent();for(const i of c.items)t+=i.str+(i.hasEOL?'\n':' ')}
+ if(t.replace(/\s/g,'').length>=30)return{text:t,ocr:false};
+ const pg=await doc.getPage(1),vp=pg.getViewport({scale:2}),cv=document.createElement('canvas');cv.width=vp.width;cv.height=vp.height;
+ await pg.render({canvasContext:cv.getContext('2d'),viewport:vp}).promise;const r=await Tesseract.recognize(cv,'eng');return{text:r.data.text,ocr:true}}
+function fromName(n){n=n.replace(/\.pdf$/i,'');const p=n.split(/\s+-\s+/).map(s=>s.trim());if(p.length<3||!p[0])return{};const d=p[1].length<=14?pd(p[1]):'';if(!d)return{};return{supplier:p[0],date:d,number:p.slice(2).join(' - ')}}
+const flags=r=>{const f=[];if(r.unreadable)f.push('Unreadable PDF');if(!r.supplier)f.push('Missing supplier');if(!r.number)f.push('Missing invoice no.');if(!r.date)f.push('Missing invoice date');return f};
+function dups(){for(const r of D.inv){r.dupOf=null;r.dateDiff=false}
+ const s=[...D.inv].sort((a,b)=>a.received.localeCompare(b.received));
+ for(let i=0;i<s.length;i++)for(let j=0;j<i;j++){const a=s[j],b=s[i];if(norm(a.supplier)&&nn(a.number)&&norm(a.supplier)===norm(b.supplier)&&nn(a.number)===nn(b.number)){b.dupOf=a.id;b.dateDiff=!!(a.date&&b.date&&a.date!==b.date);break}}}
+async function add(files){const out=[];let n=0;for(const f of files){n++;if(!/pdf$/i.test(f.type||f.name)){out.push(f.name+': not a PDF');continue}
+  $('#msg').textContent=`Reading ${n}/${files.length}: ${f.name} (scanned PDFs take longer)…`;
+  const r={id:crypto.randomUUID(),file:f.name,fileId:'',received:new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString(),supplier:'',number:'',date:'',status:'Pending Upload',confirmed:'',xeroId:'',xeroVerified:false,dismissed:false,unreadable:false};
+  try{const x=await readPdf(f);Object.assign(r,extract(x.text));r.ocr=x.ocr;if(x.text.replace(/\s/g,'').length<15)r.unreadable=true}catch(e){r.unreadable=true}
+  const fn=fromName(f.name);if(fn.supplier){Object.assign(r,fn);r.unreadable=false;r.fromName=true}
+  try{const m=r.received.slice(5,7),yf=await sub(r.received.slice(0,4),FOLDER),mf=await sub(`${m} - ${MON[+m-1]}`,yf);r.fileId=await multipart({name:f.name,parents:[mf]},f,'application/pdf')}catch(e){out.push(f.name+': upload to Drive failed');continue}
+  D.inv.push(r);dups();audit(r,'Received',f.name+(r.ocr?' (read by OCR)':'')+(r.unreadable?' (unreadable, enter details manually)':''));
+  if(r.dupOf&&!r.dismissed)out.push(f.name+': possible duplicate');await persist();render()}
+ $('#msg').textContent=out.join(' · ')||'Done.';render()}
+/* ---------- Screens ---------- */
+const fd=d=>d?`${d.slice(8,10)} ${MON[+d.slice(5,7)-1]} ${d.slice(0,4)}`:'—';
+const isDup=r=>r.dupOf&&!r.dismissed;
+const tags=r=>(isDup(r)?'<span class="t er">Duplicate'+(r.dateDiff?' (date differs)':'')+'</span>':'')+flags(r).map(f=>`<span class="t wa">${f}</span>`).join('');
+function filt(){return D.inv.filter(r=>{const t=Q.t.toLowerCase();if(t&&!(r.supplier+' '+r.number).toLowerCase().includes(t))return false;
+ if(Q.s==='dup'?!isDup(r):Q.s&&r.status!==Q.s)return false;const rd=r.received.slice(0,10);if(Q.a&&rd<Q.a&&r.date<Q.a)return false;if(Q.b&&rd>Q.b&&r.date>Q.b)return false;return true}).sort((a,b)=>b.received.localeCompare(a.received))}
+const link=r=>`https://drive.google.com/file/d/${r.fileId}/view`;
+function row(r){return `<tr><td><input type="checkbox" data-up="${r.id}" ${r.status==='Uploaded to Xero'?'checked':''} title="Uploaded to Xero"></td><td>${E(r.supplier)||'—'}</td><td>${E(r.number)||'—'}</td><td>${fd(r.date)}</td><td>${fd(r.received.slice(0,10))}</td>
+<td><span class="t ${r.status==='Pending Upload'?'wa':'ok'}">${r.status}</span></td><td>${fd(r.confirmed)}</td><td>${E(r.xeroId)||'—'}${r.status!=='Pending Upload'&&!r.xeroVerified?' <span class="t wa">unverified</span>':''}</td><td>${tags(r)}</td>
+<td><a href="${link(r)}" target="_blank" rel="noopener">PDF</a> · <a data-ed="${r.id}">Edit</a>${isDup(r)?` · <a data-nd="${r.id}">Not duplicate</a>`:''}</td></tr>`}
+function tree(key){const g={};for(const r of D.inv){const d=key==='rec'?r.received.slice(0,10):r.date;const y=d?d.slice(0,4):'No date',m=d?d.slice(5,7):'';((g[y]??={})[m]??=[]).push(r)}
+ return Object.keys(g).sort().reverse().map(y=>`<details open><summary>${y}</summary>${Object.keys(g[y]).sort().reverse().map(m=>`<details><summary>${m?MON[+m-1]+' '+y:'Unassigned'} (${g[y][m].length})</summary>${g[y][m].map(r=>`<div>${E(r.supplier||'?')} · ${E(r.number||'?')} · ${fd(r.date)} <span class="t ${r.status==='Pending Upload'?'wa':'ok'}">${r.status}</span> <a href="${link(r)}" target="_blank" rel="noopener">PDF</a></div>`).join('')}</details>`).join('')}</details>`).join('')||'<p class="note">No invoices yet.</p>'}
+function render(){const n=D.inv.length,u=D.inv.filter(r=>r.status==='Uploaded to Xero').length;
+ $('#cards').innerHTML=[['Total received',n],['Uploaded to Xero',u],['Pending upload',n-u],['Duplicates detected',D.inv.filter(isDup).length]].map(([a,b])=>`<div class="card"><b>${b}</b><span>${a}</span></div>`).join('');
+ document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.v===VIEW));
+ if(VIEW==='list'){$('#view').innerHTML=`<div class="bar"><input id="qt" placeholder="Search supplier / invoice no." value="${E(Q.t)}"><select id="qs"><option value="">All statuses</option><option>Pending Upload</option><option>Uploaded to Xero</option><option value="dup">Duplicates</option></select>From <input type="date" id="qa" value="${Q.a}"> to <input type="date" id="qb" value="${Q.b}"></div>
+ <div class="w"><table><tr><th>Xero</th><th>Supplier</th><th>Invoice no.</th><th>Invoice date</th><th>Received</th><th>Status</th><th>Confirmed</th><th>Xero ID</th><th>Flags</th><th></th></tr>${filt().map(row).join('')||'<tr><td colspan="10" class="note">No invoices.</td></tr>'}</table></div>`;
+  $('#qs').value=Q.s;for(const [i,k] of [['qt','t'],['qs','s'],['qa','a'],['qb','b']])$('#'+i).onchange=e=>{Q[k]=e.target.value;render()}}
+ else if(VIEW==='aud')$('#view').innerHTML=`<div class="w"><table><tr><th>When</th><th>Invoice</th><th>Action</th><th>Detail</th></tr>${D.aud.map(a=>`<tr><td>${new Date(a.at).toLocaleString()}</td><td>${E(a.ref)}</td><td>${E(a.act)}</td><td>${E(a.det)}</td></tr>`).join('')}</table></div>`;
+ else $('#view').innerHTML=`<p class="note">Same records and PDFs, grouped by ${VIEW==='rec'?'the date received':'the printed invoice date'}.</p>`+tree(VIEW);
+ const mo={};for(const r of D.inv){const k=r.received.slice(0,7);const o=mo[k]??={n:0,u:0};o.n++;if(r.status==='Uploaded to Xero')o.u++}
+ $('#monthly').innerHTML='<table><tr><th>Month received</th><th>Invoices</th><th>Uploaded</th><th>Pending</th></tr>'+Object.keys(mo).sort().reverse().map(k=>`<tr><td>${MON[+k.slice(5)-1]} ${k.slice(0,4)}</td><td>${mo[k].n}</td><td>${mo[k].u}</td><td>${mo[k].n-mo[k].u}</td></tr>`).join('')+'</table>'}
+document.addEventListener('click',async e=>{const t=e.target,g=a=>D.inv.find(r=>r.id===t.dataset[a]);
+ if(t.dataset.v){VIEW=t.dataset.v;render()}
+ if(t.dataset.nd){const r=g('nd');r.dismissed=true;audit(r,'Duplicate warning dismissed','Reviewed manually; file kept');await persist();render()}
+ if(t.dataset.up){const r=g('up');if(t.checked){r.status='Uploaded to Xero';r.confirmed=new Date().toISOString().slice(0,10);r.xeroVerified=false;audit(r,'Marked Uploaded to Xero','Manual, unverified')}else{r.status='Pending Upload';r.confirmed='';audit(r,'Reverted to Pending Upload')}await persist();render()}
+ if(t.dataset.ed){const r=g('ed');$('#f').innerHTML=`<h2>Edit ${E(r.file)}</h2>${flags(r).length?'<p class="er">'+flags(r).join(', ')+'</p>':''}<label>Supplier<input name="supplier" value="${E(r.supplier)}"></label><label>Invoice number<input name="number" value="${E(r.number)}"></label><label>Invoice date<input type="date" name="date" value="${r.date}"></label><label>Xero bill ID<input name="xeroId" value="${E(r.xeroId)}"></label><div class="bar"><button class="p" value="ok">Save</button><button value="x">Cancel</button></div>`;
+  $('#dlg').showModal();$('#f').onsubmit=async ev=>{if(ev.submitter.value!=='ok')return;const d=new FormData($('#f')),ch=[];for(const k of['supplier','number','date','xeroId']){const v=String(d.get(k)).trim();if(v!==r[k]){ch.push(`${k}: "${r[k]}" → "${v}"`);r[k]=v}}
+   if(ch.length){r.unreadable=false;dups();audit(r,'Corrected',ch.join('; '));await persist()}render()}}});
+const dz=$('#drop');dz.onclick=()=>$('#file').click();$('#file').onchange=e=>{add([...e.target.files]);e.target.value=''};
+dz.ondragover=e=>{e.preventDefault();dz.classList.add('over')};dz.ondragleave=()=>dz.classList.remove('over');dz.ondrop=e=>{e.preventDefault();dz.classList.remove('over');add([...e.dataTransfer.files])};
+/* ---------- Sign in ---------- */
+$('#signin').onclick=()=>{if(!window.google){$('#lmsg').textContent='Google sign-in is still loading. Wait a moment and try again.';return}
+ google.accounts.oauth2.initTokenClient({client_id:CID,scope:'https://www.googleapis.com/auth/drive.file',
+  callback:async r=>{if(r.error){$('#lmsg').textContent='Sign-in failed: '+r.error;return}TOKEN=r.access_token;$('#lmsg').textContent='Opening your Drive folder…';
+   try{await setup();dups();$('#login').hidden=true;$('#app').hidden=false;render()}catch(e){$('#lmsg').textContent='Could not open Drive: '+e.message}}}).requestAccessToken()};
+</script></body></html>
